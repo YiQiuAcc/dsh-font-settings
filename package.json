@@ -1,0 +1,55 @@
+{
+  "name": "@styiqiu/dsh-font-settings",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Replaces the DeepSeek Harness General font settings with searchable font pickers for the text, code, and terminal roles, and can list the fonts installed on the machine.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "font",
+    "font-family",
+    "typography",
+    "settings"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yiqiuacc/dsh-font-settings.git"
+  },
+  "homepage": "https://github.com/yiqiuacc/dsh-font-settings#readme",
+  "bugs": {
+    "url": "https://github.com/yiqiuacc/dsh-font-settings/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-theme"
+      ]
+    }
+  }
+}

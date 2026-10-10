@@ -1,0 +1,3 @@
+# Keep one line ending in the repository: these are source files read by Node
+# and by the harness, and LF avoids CRLF churn on Windows checkouts.
+* text=auto eol=lf

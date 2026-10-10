@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Font settings",
+    "description": "Replaces the General font settings with searchable font pickers for the text, code, and terminal roles, and can list the fonts installed on the machine."
+  }
+}

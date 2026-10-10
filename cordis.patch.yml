@@ -1,0 +1,3 @@
+- insert:
+    - id: font-settings
+      name: '@styiqiu/dsh-font-settings'
