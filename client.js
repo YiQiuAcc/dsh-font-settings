@@ -16,6 +16,12 @@
  * first-party id — if the shipped entry ever stops using it, this group simply
  * renders beside the built-in one instead of replacing it.
  *
+ * The field and the candidate card are the shared client primitives (`Input`,
+ * `MenuSurface`, `MenuGroup`) rather than hand-rolled controls, and the local
+ * catalog is listed against a filter and up to a bound: every candidate row is
+ * drawn in the family it would apply, which loads one font face per row on a
+ * cold font cache.
+ *
  * The `theme` service is taken through a scoped injection, so a composition
  * without it registers nothing at all: the built-in group stays untouched and
  * this plugin is inert. The outer plugin declares only the services it reads
@@ -25,6 +31,7 @@ window.__ModuleLoader__.load({
   id: '@styiqiu/dsh-font-settings',
   factory(require) {
     const React = require('react')
+    const { Input, MenuSurface, MenuGroup, observeStickyMenuGroups, useDismissOnOutsidePointer } = require('@deepseek-ai/dsh-client-ui-primitives')
     const h = React.createElement
 
     /** Dictionary namespace owned by this plugin. */
@@ -47,6 +54,13 @@ window.__ModuleLoader__.load({
     const LIST_ID_PREFIX = 'dsh-font-settings-list-'
     /** Id prefix of one option row, referenced by the input's aria-activedescendant. */
     const OPTION_ID_PREFIX = 'dsh-font-settings-option-'
+    /**
+     * Local candidates listed at once. Every row is painted in the family it
+     * would apply, and a cold font cache loads one face per distinct family
+     * (measured on Windows: ~8 ms each), so listing the whole catalog in one
+     * open blocks the main thread for seconds.
+     */
+    const MAX_LOCAL_ROWS = 24
 
     /** Chinese dictionary. */
     const zh = {
@@ -67,6 +81,8 @@ window.__ModuleLoader__.load({
       'font.loadLocal': '加载本机全部字体…',
       'font.localUnavailable': '本机字体列表不可用：浏览器不支持或未授权',
       'font.loaded': '已加载本机字体',
+      'font.localHint': '输入名称以检索本机字体',
+      'font.localMore': '还有更多匹配未显示，继续输入以缩小范围',
       'size.text.title': '字号大小',
       'size.code.title': '代码字号',
       'size.terminal.title': '终端字号',
@@ -94,6 +110,8 @@ window.__ModuleLoader__.load({
       'font.loadLocal': 'Load all local fonts…',
       'font.localUnavailable': 'Local font list unavailable: unsupported by the browser or not permitted',
       'font.loaded': 'Local fonts loaded',
+      'font.localHint': 'Type a name to search the local fonts',
+      'font.localMore': 'More matches hidden — keep typing to narrow the list',
       'size.text.title': 'Text size',
       'size.code.title': 'Code size',
       'size.terminal.title': 'Terminal size',
@@ -148,6 +166,10 @@ window.__ModuleLoader__.load({
      * One role's searchable font picker: an input that commits free text on blur
      * or Enter and opens a listbox of candidates while focused. Rows are drawn in
      * the family they would apply, so a name can be chosen by sight.
+     *
+     * The list is the shared menu material ({@link MenuSurface}) over groups with
+     * the shared sticky headings ({@link MenuGroup}); the catalog it lists is
+     * bounded, because drawing a row costs one loaded font family.
      * @param props - role, the persisted list, the commit callback, and the local catalog.
      * @returns the picker element tree.
      */
@@ -159,20 +181,25 @@ window.__ModuleLoader__.load({
       const [filter, setFilter] = React.useState('')
       const [open, setOpen] = React.useState(false)
       const [highlight, setHighlight] = React.useState(-1)
+      /** Whether the field holds the keyboard; see the adoption effect below. */
+      const [editing, setEditing] = React.useState(false)
       const box = React.useRef(null)
+      const viewport = React.useRef(null)
       const listId = `${LIST_ID_PREFIX}${role}`
       const title = t(`font.${role}.title`)
 
-      // The picker is a popup, so it closes on a press outside its own box.
+      // Adopt the committed list — the theme service normalizes it — as the field
+      // text whenever the field does not hold the keyboard. Adopting it while the
+      // user types would replace what is being typed with a late echo of the
+      // previous write.
       React.useEffect(() => {
-        if (!open) return undefined
-        const onPointerDown = (event) => {
-          const node = box.current
-          if (node !== null && !node.contains(event.target)) setOpen(false)
-        }
-        document.addEventListener('mousedown', onPointerDown)
-        return () => document.removeEventListener('mousedown', onPointerDown)
-      }, [open])
+        if (editing) return
+        setQuery(value)
+        setFilter('')
+      }, [value, editing])
+
+      // The picker is a popup, so it closes on a press outside its own box.
+      useDismissOnOutsidePointer(box, open, setOpen)
 
       const typed = filter.trim()
       const field = query.trim()
@@ -180,28 +207,53 @@ window.__ModuleLoader__.load({
       const matches = (text) => needle === '' || text.toLowerCase().includes(needle)
       const accepted = (text) => { setQuery(text); setFilter(''); commit(text) }
 
-      // One flat row model: `header` rows are section labels, everything else is
-      // a pickable option carrying the family stack it applies.
+      // One flat row model. `header` rows open a group, `hint` rows carry copy,
+      // and every other row is a pickable option holding the family it applies.
       const rows = []
       if (matches(t('font.default'))) {
-        rows.push({ key: '__default__', label: t('font.default'), family: '' })
+        rows.push({ kind: 'option', key: '__default__', label: t('font.default'), family: '' })
       }
       const curated = PRESETS.filter(preset => matches(preset))
       if (curated.length > 0) {
-        rows.push({ key: '__presets__', header: t('font.presets') })
-        for (const preset of curated) rows.push({ key: `preset:${preset}`, label: preset, family: preset })
+        rows.push({ kind: 'header', key: '__presets__', label: t('font.presets') })
+        for (const preset of curated) {
+          rows.push({ kind: 'option', key: `preset:${preset}`, label: preset, family: preset })
+        }
       }
-      const locals = localFonts.filter(name => matches(name) || matches(quoteFamily(name)))
-      if (locals.length > 0) {
-        rows.push({ key: '__local__', header: t('font.local') })
-        for (const name of locals) rows.push({ key: `local:${name}`, label: name, family: quoteFamily(name) })
+      // The local catalog is the only unbounded source, so it is listed against a
+      // filter and up to MAX_LOCAL_ROWS: one open drawing all of it blocks the
+      // main thread while the font cache loads a face per family.
+      const locals = needle === '' ? [] : localFonts.filter(name => matches(name) || matches(quoteFamily(name)))
+      const listed = locals.slice(0, MAX_LOCAL_ROWS)
+      if (needle === '') {
+        if (localFonts.length > 0) {
+          rows.push({ kind: 'header', key: '__local__', label: t('font.local') })
+          rows.push({ kind: 'hint', key: '__localhint__', label: `${t('font.localHint')}（${String(localFonts.length)}）` })
+        }
+      } else if (listed.length > 0) {
+        rows.push({ kind: 'header', key: '__local__', label: t('font.local') })
+        for (const name of listed) {
+          rows.push({ kind: 'option', key: `local:${name}`, label: name, family: quoteFamily(name) })
+        }
+        if (locals.length > listed.length) {
+          rows.push({ kind: 'hint', key: '__localmore__', label: `${t('font.localMore')}（${String(locals.length - listed.length)}）` })
+        }
       }
       const exact = curated.includes(typed) || locals.some(name => name === typed || quoteFamily(name) === typed)
       if (typed !== '' && !exact) {
-        rows.push({ key: '__typed__', label: t('font.custom') + typed, family: typed })
+        rows.push({ kind: 'option', key: '__typed__', label: t('font.custom') + typed, family: typed })
       }
-      const selectable = rows.map((row, index) => row.header === undefined ? index : -1).filter(index => index >= 0)
-      const active = rows[highlight] !== undefined && rows[highlight].header === undefined ? highlight : -1
+      const isOption = (row) => row.kind === 'option'
+      const selectable = rows.map((row, index) => isOption(row) ? index : -1).filter(index => index >= 0)
+      const active = highlight >= 0 && rows[highlight] !== undefined && isOption(rows[highlight]) ? highlight : -1
+      /** Group keys the sticky-heading observer is built for; re-observe when that set changes. */
+      const headerKeys = rows.filter(row => row.kind === 'header').map(row => row.key).join('|')
+
+      // Group headings stick while their rows scroll, using the shared observer.
+      React.useEffect(() => {
+        if (!open || viewport.current === null) return undefined
+        return observeStickyMenuGroups(viewport.current)
+      }, [open, headerKeys])
 
       /** Close the list, drop the filter, and apply one row. */
       const pick = (row) => {
@@ -227,7 +279,7 @@ window.__ModuleLoader__.load({
        */
       const applyTyped = () => {
         const wanted = typed !== '' ? typed : field
-        const named = rows.find(row => row.family === wanted)
+        const named = rows.find(row => isOption(row) && row.family === wanted)
         if (named !== undefined) pick(named)
         else accepted(wanted)
       }
@@ -260,7 +312,7 @@ window.__ModuleLoader__.load({
         if (event.key === 'Enter') {
           event.preventDefault()
           const row = rows[highlight]
-          if (open && row !== undefined && row.header === undefined) pick(row)
+          if (open && row !== undefined && isOption(row)) pick(row)
           else applyTyped()
         }
       }
@@ -276,10 +328,10 @@ window.__ModuleLoader__.load({
           gap: 8,
           alignItems: 'center',
           padding: '7px 10px',
-          borderRadius: 6,
+          borderRadius: 'var(--dsw-radius-md)',
           cursor: 'pointer',
           color: 'var(--dsw-alias-label-primary)',
-          background: index === highlight ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+          background: index === highlight ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
         },
       },
       h('span', {
@@ -299,70 +351,89 @@ window.__ModuleLoader__.load({
         'aria-hidden': true,
       }, '✓'))
 
-      const listRow = (row, index) => row.header !== undefined
-        ? h('div', {
-          key: row.key,
-          style: {
-            padding: '6px 10px 2px',
-            fontSize: 12,
-            lineHeight: '18px',
-            color: 'var(--dsw-alias-label-tertiary)',
-          },
-        }, row.header)
-        : option(row, index)
+      const hint = (row) => h('div', {
+        key: row.key,
+        style: {
+          padding: '6px 10px',
+          fontSize: 13,
+          lineHeight: '20px',
+          color: 'var(--dsw-alias-label-tertiary)',
+        },
+      }, row.label)
 
-      return h('div', { ref: box, style: { position: 'relative', width: '100%' } },
-        h('input', {
-          type: 'search',
-          value: query,
-          role: 'combobox',
-          'aria-expanded': open,
-          'aria-controls': listId,
-          'aria-autocomplete': 'list',
-          'aria-activedescendant': active === -1 ? undefined : `${OPTION_ID_PREFIX}${role}-${String(active)}`,
-          'aria-label': title,
-          placeholder: t('font.search'),
-          spellCheck: false,
-          autoComplete: 'off',
-          onFocus: () => { setOpen(true); setHighlight(-1); setFilter('') },
-          // Committing with Enter closes the list but keeps focus on the field,
-          // so a press has to reopen it; the typed filter stays as it is.
-          onClick: () => { setOpen(true) },
-          onChange: (event) => { setQuery(event.target.value); setFilter(event.target.value); setOpen(true); setHighlight(-1) },
-          onKeyDown,
-          onBlur: () => { setOpen(false); accepted(query) },
-          style: {
-            boxSizing: 'border-box',
-            width: '100%',
-            padding: '7px 10px',
-            borderRadius: 'var(--dsw-radius-md)',
-            border: '0.5px solid var(--dsw-alias-border-l4)',
-            background: 'var(--dsw-alias-bg-layer-1)',
-            color: 'var(--dsw-alias-label-primary)',
-            fontFamily: 'inherit',
-            fontSize: 14,
-            lineHeight: '22px',
-          },
-        }),
-        open && h('div', {
-          id: listId,
-          role: 'listbox',
-          'aria-label': t('font.suggestions'),
-          style: {
-            position: 'absolute',
-            zIndex: 30,
-            top: 'calc(100% + 4px)',
-            left: 0,
-            right: 0,
-            maxHeight: 280,
-            overflowY: 'auto',
-            padding: 4,
-            borderRadius: 'var(--dsw-radius-md)',
-            border: '0.5px solid var(--dsw-alias-border-l4)',
-            background: 'var(--dsw-alias-bg-layer-1)',
-            boxShadow: '0 8px 24px rgba(0, 0, 0, 0.18)',
-          },
-        }, rows.map(listRow)))
+      /** Lay the flat rows out as groups: a header opens a MenuGroup holding the rows after it. */
+      const listChildren = () => {
+        const children = []
+        let group = null
+        const flush = () => {
+          if (group === null) return
+          children.push(h(MenuGroup, { key: group.key, label: group.label }, group.rows))
+          group = null
+        }
+        rows.forEach((row, index) => {
+          if (row.kind === 'header') {
+            flush()
+            group = { key: row.key, label: row.label, rows: [] }
+            return
+          }
+          const node = row.kind === 'hint' ? hint(row) : option(row, index)
+          if (group === null) children.push(node)
+          else group.rows.push(node)
+        })
+        flush()
+        return children
+      }
+
+      return h('div', {
+        ref: box,
+        style: { position: 'relative', width: '100%', display: 'flex', flexDirection: 'column' },
+      },
+      h(Input, {
+        value: query,
+        role: 'combobox',
+        'aria-expanded': open,
+        'aria-controls': listId,
+        'aria-autocomplete': 'list',
+        'aria-activedescendant': active === -1 ? undefined : `${OPTION_ID_PREFIX}${role}-${String(active)}`,
+        'aria-label': title,
+        placeholder: t('font.search'),
+        spellCheck: false,
+        autoComplete: 'off',
+        onFocus: () => { setEditing(true); setOpen(true); setHighlight(-1); setFilter('') },
+        // Committing with Enter closes the list but keeps focus on the field,
+        // so a press has to reopen it; the typed filter stays as it is.
+        onClick: () => { setOpen(true) },
+        onChange: (event) => { setQuery(event.target.value); setFilter(event.target.value); setOpen(true); setHighlight(-1) },
+        onKeyDown,
+        onBlur: () => { setEditing(false); setOpen(false); accepted(query) },
+      }),
+      open && h(MenuSurface, {
+        style: {
+          position: 'absolute',
+          zIndex: 30,
+          top: 'calc(100% + 4px)',
+          left: 0,
+          right: 0,
+          padding: 4,
+          boxShadow: 'var(--dsw-elevation-prominent)',
+          // The elevated surface takes the l2 scrollbar pair, as Menu's own card does.
+          '--dsh-scrollbar-thumb': 'var(--dsw-alias-scrollbar-bg-l2)',
+          '--dsh-scrollbar-thumb-hover': 'var(--dsw-alias-scrollbar-hover-l2)',
+        },
+      },
+      h('div', {
+        ref: viewport,
+        id: listId,
+        role: 'listbox',
+        'aria-label': t('font.suggestions'),
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          minHeight: 0,
+          maxHeight: 280,
+          overflowY: 'auto',
+        },
+      }, listChildren())))
     }
 
     /**
@@ -498,7 +569,6 @@ window.__ModuleLoader__.load({
               change: (next) => { commitSize(spec, next) },
             })),
           h(FontPicker, {
-            key: snapshot.fontFamilies[spec.role],
             t,
             role: spec.role,
             value: snapshot.fontFamilies[spec.role],
